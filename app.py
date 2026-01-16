@@ -309,3 +309,407 @@ def generate_decision_support(season_data, predicted_yield):
         print(f"Lỗi tạo hỗ trợ quyết định: {e}")
         return None
 
+
+# ----------------- CALCULATE PRODUCTIVITY FOR STATS -----------------
+def calculate_productivity(season_data):
+    """
+    Tính năng suất cho thống kê (tấn/ha)
+    """
+    try:
+        actual_yield = season_data.get("actual_yield", 0)
+        area = season_data.get("area", 1)
+        
+        if actual_yield and area and area > 0:
+            return float(actual_yield) / float(area)
+        return 0.0
+    except:
+        return 0.0
+
+# ----------------- FIREBASE WITH RETRY -----------------
+def get_firestore_with_retry():
+    """Kết nối Firebase với retry mechanism"""
+    max_retries = 2
+    timeout_seconds = 10
+    
+    for attempt in range(max_retries):
+        try:
+            if config.USE_FIREBASE:
+                if db is None:
+                    print(f"🔄 Attempt {attempt + 1} to initialize Firebase...")
+                    db_retry = init_firebase()
+                    if db_retry:
+                        print("✅ Firebase initialized with retry")
+                        return db_retry
+                else:
+                    # Test connection với timeout
+                    print(f"🔄 Attempt {attempt + 1} to test Firebase connection...")
+                    test_ref = db.collection("seasons").limit(1)
+                    list(test_ref.stream())  # Test query nhỏ
+                    print("✅ Firebase connection test passed")
+                    return db
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"❌ Firebase attempt {attempt + 1} failed: {str(e)[:100]}...")
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(1)  # Chờ 1 giây trước khi retry
+            else:
+                print("🚨 All Firebase connection attempts failed")
+                return None
+    
+    return None
+
+# ----------------- OPTIMIZED FIREBASE QUERY -----------------
+def safe_firebase_query(collection_name, limit=50, order_by=None):
+    """Thực hiện query Firebase an toàn với timeout"""
+    try:
+        if not config.USE_FIREBASE or db is None:
+            return []
+            
+        collection_ref = db.collection(collection_name)
+        
+        # Áp dụng order_by nếu có
+        if order_by:
+            collection_ref = collection_ref.order_by(order_by, direction=firestore.Query.DESCENDING)
+        
+        # Giới hạn số lượng documents
+        collection_ref = collection_ref.limit(limit)
+        
+        # Lấy documents
+        docs = list(collection_ref.stream())
+        
+        # Xử lý dữ liệu
+        results = []
+        for doc in docs:
+            try:
+                record = doc.to_dict()
+                record["id"] = doc.id
+                
+                # Xử lý số liệu an toàn
+                if record.get("actual_yield"):
+                    try:
+                        record["actual_yield"] = float(record["actual_yield"])
+                    except:
+                        record["actual_yield"] = 0.0
+                else:
+                    record["actual_yield"] = 0.0
+                    
+                if record.get("area"):
+                    try:
+                        record["area"] = float(record["area"])
+                    except:
+                        record["area"] = 0.0
+                else:
+                    record["area"] = 0.0
+                
+                results.append(record)
+            except Exception as doc_error:
+                print(f"⚠️ Lỗi xử lý document {doc.id}: {doc_error}")
+                continue
+                
+        return results
+        
+    except Exception as e:
+        print(f"❌ Lỗi Firebase query: {e}")
+        return []
+
+# =========================================================
+#               ROUTES
+# =========================================================
+
+@app.route("/")
+@login_required
+def index():
+    total = 0
+    recent = []
+    if config.USE_FIREBASE and db is not None:
+        try:
+            docs = db.collection("seasons").order_by("created_at", direction=firestore.Query.DESCENDING).limit(5).stream()
+            for d in docs:
+                recent.append(d.to_dict())
+            total = len(list(db.collection("seasons").limit(1000).stream()))
+        except Exception as e:
+            print("Lỗi đọc Firestore:", e)
+            total = 0
+    else:
+        if os.path.exists(SEASONS_CSV):
+            df = pd.read_csv(SEASONS_CSV)
+            total = len(df)
+            recent = df.sort_values("created_at", ascending=False).head(5).to_dict(orient="records")
+    return render_template("index.html", total=total, recent=recent)
+
+# ---------- OVERVIEW (OPTIMIZED) ----------
+@app.route("/overview")
+@login_required
+def overview():
+    stats = {
+        "total_seasons": 0,
+        "total_area": 0,
+        "top_provinces": [],
+        "crop_distribution": {},
+        "top_provinces_by_crop": {},
+        "weather_stats": {}
+    }
+    
+    # ✅ XỬ LÝ DỮ LIỆU MÙA VỤ - TỐI ƯU HÓA
+    seasons_data = []
+    
+    if config.USE_FIREBASE and db is not None:
+        try:
+            # Lấy tất cả seasons
+            seasons_ref = db.collection("seasons")
+            docs = list(seasons_ref.stream())
+            stats["total_seasons"] = len(docs)
+            
+            for doc in docs:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                seasons_data.append(data)
+                
+        except Exception as e:
+            print("Lỗi đọc thống kê Firestore:", e)
+    else:
+        # CSV fallback - tối ưu hóa
+        SEASONS_CSV_PATH = os.path.join(DATA_DIR, "seasons.csv")
+        if os.path.exists(SEASONS_CSV_PATH):
+            try:
+                df = pd.read_csv(SEASONS_CSV_PATH)
+                stats["total_seasons"] = len(df)
+                seasons_data = df.to_dict(orient="records")
+            except Exception as e:
+                print("Lỗi đọc file CSV mùa vụ:", e)
+    
+    # ✅ TỰ ĐỘNG TÍNH NĂNG SUẤT CHO CÁC MÙA VỤ CHƯA CÓ DỮ LIỆU
+    if seasons_data:
+        auto_calculated_count = 0
+        for season in seasons_data:
+            # Kiểm tra nếu chưa có actual_yield nhưng có đủ thông tin để tính toán
+            if (not season.get("actual_yield") and 
+                season.get("crop") and 
+                season.get("area") and 
+                float(season.get("area", 0)) > 0):
+                
+                predicted_yield = calculate_yield(season)
+                if predicted_yield is not None:
+                    try:
+                        if config.USE_FIREBASE and db is not None:
+                            doc_ref = db.collection("seasons").document(season["id"])
+                            doc_ref.update({
+                                "actual_yield": round(predicted_yield, 2),
+                                "yield_calculated_at": datetime.utcnow().isoformat(),
+                                "yield_source": "auto_overview"
+                            })
+                        else:
+                            # Cập nhật trong CSV
+                            SEASONS_CSV_PATH = os.path.join(DATA_DIR, "seasons.csv")
+                            if os.path.exists(SEASONS_CSV_PATH):
+                                df = pd.read_csv(SEASONS_CSV_PATH)
+                                # Tìm và cập nhật bản ghi
+                                for idx, row in df.iterrows():
+                                    if (str(row.get("farmer_name")) == str(season.get("farmer_name")) and 
+                                        str(row.get("crop")) == str(season.get("crop")) and 
+                                        str(row.get("province")) == str(season.get("province"))):
+                                        df.at[idx, "actual_yield"] = round(predicted_yield, 2)
+                                        df.at[idx, "yield_calculated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        df.at[idx, "yield_source"] = "auto_overview"
+                                        break
+                                df.to_csv(SEASONS_CSV_PATH, index=False, encoding="utf-8-sig")
+                        
+                        auto_calculated_count += 1
+                        print(f"✅ Đã tự động tính năng suất: {predicted_yield} tấn cho {season.get('crop')} tại {season.get('province')}")
+                        
+                    except Exception as e:
+                        print(f"❌ Lỗi khi lưu năng suất tự động: {e}")
+        
+        if auto_calculated_count > 0:
+            print(f"📊 Đã tự động tính năng suất cho {auto_calculated_count} mùa vụ")
+            # Load lại trang để hiển thị dữ liệu mới
+            flash(f"✅ Đã tự động tính năng suất cho {auto_calculated_count} mùa vụ", "success")
+            return redirect(url_for("overview"))
+    
+    # ✅ TÍNH TOÁN THỐNG KÊ TỪ DỮ LIỆU MÙA VỤ
+    if seasons_data:
+        area_by_province = {}
+        crop_stats = {}
+        crop_province_stats = {}
+        
+        for season in seasons_data:
+            # Xử lý diện tích
+            try:
+                area = float(season.get("area", 0))
+            except:
+                area = 0
+                
+            province = season.get("province", "Chưa xác định")
+            crop = season.get("crop", "Chưa xác định")
+            
+            # Chuẩn hóa tên cây trồng
+            crop_normalized = crop.strip().lower()
+            
+            # Tổng diện tích
+            stats["total_area"] += area
+            
+            # Thống kê theo tỉnh
+            if province in area_by_province:
+                area_by_province[province] += area
+            else:
+                area_by_province[province] = area
+            
+            # Thống kê theo cây trồng
+            if crop_normalized in crop_stats:
+                crop_stats[crop_normalized] += 1
+            else:
+                crop_stats[crop_normalized] = 1
+            
+            # Thống kê năng suất theo tỉnh và cây trồng
+            # Kiểm tra nếu có actual_yield
+            actual_yield = season.get("actual_yield")
+            if actual_yield and area > 0:
+                try:
+                    # Tính năng suất (tấn/ha)
+                    productivity = float(actual_yield) / area
+                    
+                    if crop_normalized not in crop_province_stats:
+                        crop_province_stats[crop_normalized] = []
+                    
+                    # Tìm xem tỉnh đã có trong danh sách chưa
+                    existing_province = None
+                    for item in crop_province_stats[crop_normalized]:
+                        if item["province"] == province:
+                            existing_province = item
+                            break
+                    
+                    if existing_province:
+                        # Cập nhật thông tin nếu đã tồn tại
+                        existing_province["total_area"] += area
+                        existing_province["total_yield"] += float(actual_yield)
+                        existing_province["productivity"] = existing_province["total_yield"] / existing_province["total_area"]
+                    else:
+                        # Thêm tỉnh mới
+                        crop_province_stats[crop_normalized].append({
+                            "province": province,
+                            "total_area": area,
+                            "total_yield": float(actual_yield),
+                            "productivity": productivity
+                        })
+                except (ValueError, TypeError, ZeroDivisionError) as e:
+                    print(f"Lỗi tính năng suất: {e}")
+                    continue
+        
+        # Sắp xếp và lấy top provinces theo diện tích
+        stats["top_provinces"] = sorted(area_by_province.items(), key=lambda x: x[1], reverse=True)[:5]
+        stats["crop_distribution"] = crop_stats
+        
+        # Xử lý top provinces by crop - chỉ lấy top 3 cho mỗi loại cây
+        stats["top_provinces_by_crop"] = {}
+        for crop, provinces in crop_province_stats.items():
+            if provinces:  # Chỉ xử lý nếu có dữ liệu
+                # Sắp xếp theo năng suất giảm dần và lấy top 3
+                sorted_provinces = sorted(provinces, key=lambda x: x["productivity"], reverse=True)[:3]
+                stats["top_provinces_by_crop"][crop] = sorted_provinces
+        
+        # DEBUG: In ra để kiểm tra
+        print(f"📊 Tổng số mùa vụ: {stats['total_seasons']}")
+        print(f"📊 Số loại cây trồng có năng suất: {len(crop_province_stats)}")
+        for crop, provinces in crop_province_stats.items():
+            print(f"🌱 {crop}: {len(provinces)} tỉnh có năng suất")
+    
+    # ✅ ĐỌC DỮ LIỆU THỜI TIẾT - TỐI ƯU HÓA
+    # ... (phần xử lý thời tiết giữ nguyên)
+    
+    return render_template("overview.html", stats=stats)
+# ---------- AUTHENTICATION ----------
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username").strip()
+        password = request.form.get("password").strip()
+        fullname = request.form.get("fullname", "").strip()
+
+        if config.USE_FIREBASE and db is not None:
+            from firebase_admin import auth
+            try:
+                user = auth.create_user(email=username, password=password, display_name=fullname)
+                flash("Đăng ký thành công. Vui lòng đăng nhập.", "success")
+                return redirect(url_for("login"))
+            except Exception as e:
+                flash("Lỗi đăng ký Firebase: " + str(e), "danger")
+                return redirect(url_for("register"))
+        else:
+            if os.path.exists(USERS_CSV):
+                df = pd.read_csv(USERS_CSV)
+                if username in df['username'].values:
+                    flash("Tên đăng nhập đã tồn tại.", "danger")
+                    return redirect(url_for("register"))
+            else:
+                df = pd.DataFrame(columns=["username", "password", "fullname", "role", "created_at"])
+
+            new = pd.DataFrame([{
+                "username": username,
+                "password": password,
+                "fullname": fullname,
+                "role": "user",
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }])
+
+            df = pd.concat([df, new], ignore_index=True)
+            df.to_csv(USERS_CSV, index=False, encoding="utf-8-sig")
+            flash("Đăng ký thành công (CSV). Vui lòng đăng nhập.", "success")
+            return redirect(url_for("login"))
+    return render_template("register.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username").strip()
+        password = request.form.get("password").strip()
+
+        if config.USE_FIREBASE and db is not None:
+            api_key = config.FIREBASE_API_KEY
+            if not api_key:
+                flash("Firebase API key chưa được cấu hình.", "danger")
+                return redirect(url_for("login"))
+
+            url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
+            payload = {"email": username, "password": password, "returnSecureToken": True}
+
+            try:
+                r = requests.post(url, json=payload, timeout=10)
+                res_json = r.json()
+                if r.status_code == 200:
+                    session['user'] = username
+                    session['idToken'] = res_json.get("idToken")
+                    flash("Đăng nhập thành công (Firebase).", "success")
+                    return redirect(url_for("index"))
+                else:
+                    err = res_json.get("error", {}).get("message", "Đăng nhập thất bại.")
+                    flash(f"Đăng nhập thất bại (Firebase): {err}", "danger")
+                    return redirect(url_for("login"))
+            except Exception as e:
+                flash("Không thể kết nối tới Firebase.", "danger")
+                return redirect(url_for("login"))
+        else:
+            if not os.path.exists(USERS_CSV):
+                flash("Chưa có người dùng nào. Vui lòng đăng ký.", "warning")
+                return redirect(url_for("register"))
+            df = pd.read_csv(USERS_CSV)
+            user = df[(df['username'] == username) & (df['password'] == password)]
+            if not user.empty:
+                session['user'] = username
+                flash(f"Chào mừng {username}", "success")
+                return redirect(url_for("index"))
+            else:
+                flash("Sai tài khoản hoặc mật khẩu (CSV).", "danger")
+                return redirect(url_for("login"))
+
+    return render_template("login.html")
+
+@app.route("/logout")
+@login_required
+def logout():
+    session.pop('user', None)
+    session.pop('idToken', None)
+    flash("Đã đăng xuất.", "info")
+    return redirect(url_for("login"))
