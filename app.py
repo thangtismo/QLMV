@@ -39,3 +39,29 @@ def after_request(response):
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
     return response
+# =========================================================
+#               SESSION & SECURITY
+# =========================================================
+
+# ----------------- RESET SESSION ON STARTUP -----------------
+@app.before_request
+def clear_session_on_start():
+    if request.endpoint == 'static':
+        return
+    if not hasattr(app, '_session_cleared'):
+        session.clear()
+        app._session_cleared = True
+
+@app.before_request
+def make_session_permanent():
+    session.permanent = True
+
+# ----------------- LOGIN CHECK DECORATOR -----------------
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user' not in session:
+            flash("Vui lòng đăng nhập để truy cập trang này.", "warning")
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
