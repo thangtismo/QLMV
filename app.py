@@ -26,3 +26,16 @@ def internal_error(error):
     print(f"Internal Server Error: {error}")
     return render_template('500.html'), 500
 
+@app.errorhandler(Exception)
+def handle_exception(error):
+    print(f"Unhandled Exception: {error}")
+    flash("Đã xảy ra lỗi hệ thống. Vui lòng thử lại.", "danger")
+    return redirect(url_for('index'))
+
+@app.after_request
+def after_request(response):
+    """Thêm headers để tránh caching issues"""
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
